@@ -1,0 +1,8 @@
+pglite_open
+pglite_open_with_options
+pglite_exec
+pglite_exec_protocol
+pglite_close
+pglite_error
+pglite_global_error
+pglite_free

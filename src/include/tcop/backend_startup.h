@@ -14,6 +14,8 @@
 #ifndef BACKEND_STARTUP_H
 #define BACKEND_STARTUP_H
 
+#include "libpq/libpq-be.h"
+
 /*
  * CAC_state is passed from postmaster to the backend process, to indicate
  * whether the connection should be accepted, or if the process should just
@@ -37,5 +39,9 @@ typedef struct BackendStartupData
 } BackendStartupData;
 
 extern void BackendMain(char *startup_data, size_t startup_data_len) pg_attribute_noreturn();
+
+#ifdef __PGLITE__
+extern int ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done);
+#endif
 
 #endif							/* BACKEND_STARTUP_H */

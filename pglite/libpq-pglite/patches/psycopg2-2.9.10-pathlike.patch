@@ -1,0 +1,25 @@
+--- a/lib/__init__.py
++++ b/lib/__init__.py
+@@ -16,6 +16,9 @@
+   * `Value objects constructors`: Binary, Date, DateFromTicks, Time,
+     TimeFromTicks, Timestamp, TimestampFromTicks
+ """
++
++import os
++
+ # psycopg/__init__.py - initialization of the psycopg module
+ #
+ # Copyright (C) 2003-2019 Federico Di Gregorio  <fog@debian.org>
+@@ -112,6 +115,12 @@
+     library: the list of supported parameters depends on the library version.
+ 
+     """
++    if dsn is not None and isinstance(dsn, os.PathLike):
++        dsn = os.fspath(dsn)
++    kwargs = {
++        key: os.fspath(value) if isinstance(value, os.PathLike) else value
++        for key, value in kwargs.items()
++    }
+     kwasync = {}
+     if 'async' in kwargs:
+         kwasync['async'] = kwargs.pop('async')

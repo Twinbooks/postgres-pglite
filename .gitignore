@@ -53,3 +53,6 @@ lib*.pc
 dist
 *.defs.txt
 *.undef.txt
+
+/pglite/out/
+/pglite/libpq-pglite/test-libpq-pglite

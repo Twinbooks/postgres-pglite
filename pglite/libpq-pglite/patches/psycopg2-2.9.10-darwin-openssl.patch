@@ -1,0 +1,16 @@
+--- a/setup.py
++++ b/setup.py
+@@ -334,8 +334,12 @@ class psycopg_build_ext(build_ext):
+     def finalize_darwin(self):
+         """Finalize build system configuration on darwin platform."""
+-        self.libraries.append('ssl')
+-        self.libraries.append('crypto')
++        pg_config_helper = PostgresConfig(self)
++        configure_args = pg_config_helper.query("configure", empty_ok=True)
++        if "--with-openssl=no" in configure_args:
++            return
++        self.libraries.append('ssl')
++        self.libraries.append('crypto')
+ 
+     def finalize_linux(self):
+         """Finalize build system configuration on GNU/Linux platform."""

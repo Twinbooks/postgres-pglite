@@ -22,6 +22,10 @@
 /* Ideally this would be in a .h file, but it hardly seems worth the trouble */
 extern const char *select_default_timezone(const char *share_path);
 
+#ifdef __PGLITE__
+#define pg_open_tzfile pglite_pg_open_tzfile
+#endif
+
 
 #ifndef SYSTEMTZDIR
 static char tzdirpath[MAXPGPATH];

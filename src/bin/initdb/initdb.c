@@ -82,6 +82,36 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 
+#ifdef __PGLITE__
+extern int pglite_embedded_initdb_mode;
+
+static void
+pglite_append_shell_string(PQExpBuffer buf, const char *str)
+{
+	const unsigned char *ptr;
+
+	appendPQExpBufferChar(buf, '\'');
+	for (ptr = (const unsigned char *) str; *ptr != '\0'; ptr++)
+	{
+		if (*ptr == '\'')
+			appendPQExpBufferStr(buf, "'\\''");
+		else
+			appendPQExpBufferChar(buf, (char) *ptr);
+	}
+	appendPQExpBufferChar(buf, '\'');
+}
+
+static char *
+pglite_simple_prompt(const char *prompt, bool echo)
+{
+	pg_fatal("embedded initdb does not support interactive prompts");
+	return NULL;
+}
+
+#define appendShellString pglite_append_shell_string
+#define simple_prompt pglite_simple_prompt
+#endif
+
 
 /* Ideally this would be in a .h file, but it hardly seems worth the trouble */
 extern const char *select_default_timezone(const char *share_path);
@@ -1202,6 +1232,11 @@ test_config_settings(void)
 static bool
 test_specific_config_settings(int test_conns, int test_buffs)
 {
+#ifdef __PGLITE__
+	if (pglite_embedded_initdb_mode != 0)
+		return true;
+#endif
+
 	PQExpBufferData cmd;
 	_stringlist *gnames,
 			   *gvalues;
@@ -2625,6 +2660,29 @@ setup_pgdata(void)
 void
 setup_bin_paths(const char *argv0)
 {
+#ifdef __PGLITE__
+	if (pglite_embedded_initdb_mode != 0)
+	{
+		if (find_my_exec(argv0, backend_exec) < 0)
+			pg_fatal("embedded initdb could not resolve backend executable \"%s\"", argv0);
+
+		strcpy(bin_path, backend_exec);
+		*last_dir_separator(bin_path) = '\0';
+		canonicalize_path(bin_path);
+
+		if (!share_path)
+		{
+			share_path = pg_malloc(MAXPGPATH);
+			get_share_path(backend_exec, share_path);
+		}
+		else if (!is_absolute_path(share_path))
+			pg_fatal("input file location must be an absolute path");
+
+		canonicalize_path(share_path);
+		return;
+	}
+#endif
+
 	int			ret;
 
 	if ((ret = find_other_exec(argv0, "postgres", PG_BACKEND_VERSIONSTR,

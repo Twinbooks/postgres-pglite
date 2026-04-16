@@ -308,8 +308,11 @@ pq_init(ClientSocket *client_sock)
 								   port->sock, NULL, NULL);
 	latch_pos = AddWaitEventToSet(FeBeWaitSet, WL_LATCH_SET, PGINVALID_SOCKET,
 								  MyLatch, NULL);
-	AddWaitEventToSet(FeBeWaitSet, WL_POSTMASTER_DEATH, PGINVALID_SOCKET,
-					  NULL, NULL);
+	if (IsUnderPostmaster)
+	{
+		AddWaitEventToSet(FeBeWaitSet, WL_POSTMASTER_DEATH, PGINVALID_SOCKET,
+						  NULL, NULL);
+	}
 
 	/*
 	 * The event positions match the order we added them, but let's sanity

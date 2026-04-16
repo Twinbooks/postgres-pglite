@@ -85,6 +85,12 @@ extern void PostgresSingleUserMain(int argc, char *argv[],
 								   const char *username) pg_attribute_noreturn();
 extern void PostgresMain(const char *dbname,
 						 const char *username) pg_attribute_noreturn();
+#ifdef __PGLITE__
+extern void PostgresSendReadyForQueryIfNecessary(void);
+extern void PostgresMainResetAfterLongJmp(void);
+extern void PostgresMainLoopOnce(void);
+extern void PostgresMainLongJmp(void);
+#endif
 extern long get_stack_depth_rlimit(void);
 extern void ResetUsage(void);
 extern void ShowUsage(const char *title);

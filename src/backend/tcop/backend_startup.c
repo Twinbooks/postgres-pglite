@@ -47,7 +47,7 @@ bool		Trace_connection_negotiation = false;
 static void BackendInitialize(ClientSocket *client_sock, CAC_state cac);
 static int	ProcessSSLStartup(Port *port);
 
-#if defined(__EMSCRIPTEN__)
+#if defined(__EMSCRIPTEN__) || defined(__PGLITE__)
 int	ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done);
 #else
 static int	ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done);
@@ -461,6 +461,8 @@ reject:
  */
 #if defined(__EMSCRIPTEN__)
 int EMSCRIPTEN_KEEPALIVE
+#elif defined(__PGLITE__)
+int
 #else
 static int
 #endif

@@ -26,6 +26,9 @@ ZICOBJS = \
 	$(WIN32RES) \
 	zic.o
 
+PGLITE_REMAP_CFLAGS = -D__PGLITE__ -Dexit=pgl_exit -Dfcntl=pgl_fcntl -Datexit=pgl_atexit -Dsetsockopt=pgl_setsockopt -Dgetsockopt=pgl_getsockopt -Dgetsockname=pgl_getsockname -Drecv=pgl_recv -Dsend=pgl_send -Dconnect=pgl_connect -Dpoll=pgl_poll -Dshmget=pgl_shmget -Dshmat=pgl_shmat -Dshmdt=pgl_shmdt -Dshmctl=pgl_shmctl -Dlongjmp=pgl_longjmp -Dsiglongjmp=pgl_siglongjmp
+ZIC_CFLAGS = $(filter-out $(PGLITE_REMAP_CFLAGS),$(CFLAGS))
+
 # we now distribute the timezone data as a single file
 TZDATAFILES = $(srcdir)/data/tzdata.zi
 
@@ -55,8 +58,11 @@ ZIC= ./zic
 endif
 endif
 
+zic.o: zic.c
+	$(CC) $(ZIC_CFLAGS) $(CPPFLAGS) -c -o $@ $<
+
 zic: $(ZICOBJS) | submake-libpgport
-	$(CC) $(CFLAGS) $(ZICOBJS) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
+	$(CC) $(ZIC_CFLAGS) $(ZICOBJS) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
 
 install: all installdirs
 ifeq (,$(with_system_tzdata))

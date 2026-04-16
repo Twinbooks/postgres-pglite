@@ -201,6 +201,12 @@ static void drop_unnamed_stmt(void);
 static void log_disconnections(int code, Datum arg);
 static void enable_statement_timeout(void);
 static void disable_statement_timeout(void);
+extern void PostgresSendReadyForQueryIfNecessary(void);
+#ifdef __PGLITE__
+extern void PostgresMainResetAfterLongJmp(void);
+#endif
+extern void PostgresMainLoopOnce(void);
+extern void PostgresMainLongJmp(void);
 
 
 /* these must be volatile to ensure state is preserved across longjmp: */
@@ -219,6 +225,9 @@ static volatile bool idle_session_timeout_enabled = false;
 extern sigjmp_buf postgresmain_sigjmp_buf;
 extern int pgl_sigsetjmp(sigjmp_buf env, int savesigs);
 extern int is_pglite_active;
+extern int pglite_single_user_startup_mode;
+
+static int	pglite_dummy_socket_pair[2] = {PGINVALID_SOCKET, PGINVALID_SOCKET};
 
 void initDummyPort() {
 	ClientSocket s;
@@ -228,7 +237,19 @@ void initDummyPort() {
 	/* Switch to TopMemoryContext so the Port survives MessageContext resets */
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 
-	s.sock = 1;
+	if (pglite_dummy_socket_pair[0] != PGINVALID_SOCKET)
+		close(pglite_dummy_socket_pair[0]);
+	if (pglite_dummy_socket_pair[1] != PGINVALID_SOCKET)
+		close(pglite_dummy_socket_pair[1]);
+	pglite_dummy_socket_pair[0] = PGINVALID_SOCKET;
+	pglite_dummy_socket_pair[1] = PGINVALID_SOCKET;
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, pglite_dummy_socket_pair) != 0)
+		ereport(FATAL,
+				(errcode_for_socket_access(),
+				 errmsg("could not create dummy socket pair for embedded PGlite: %m")));
+
+	s.sock = pglite_dummy_socket_pair[0];
 
 	/* Set up a valid-looking localhost address */
 	memset(&s.raddr, 0, sizeof(s.raddr));
@@ -251,20 +272,6 @@ void pgl_startPGlite() {
     // so set it to false
     ExitOnAnyError = false;
     MyBackendType = B_BACKEND;
-	IsPostmasterEnvironment = true;
-	IsUnderPostmaster = true;
-
-	if (!load_hba())
-	{
-		/*
-		 * It makes no sense to continue if we fail to load the HBA file,
-		 * since there is no way to connect to the database in this case.
-		 */
-		ereport(FATAL,
-		/* translator: %s is a configuration file */
-				(errmsg("could not load %s", HbaFileName)));
-	}
-
 }
 
 void pgl_pq_flush() {
@@ -4431,6 +4438,14 @@ void PostgresSendReadyForQueryIfNecessary() {
 		}
 }
 
+#ifdef __PGLITE__
+void PostgresMainResetAfterLongJmp() {
+	PG_exception_stack = &postgresmain_sigjmp_buf;
+	if (!ignore_till_sync)
+		send_ready_for_query = true;	/* initially, or after error */
+}
+#endif
+
 void PostgresMainLoopOnce() {
 
 		int			firstchar;
@@ -5110,16 +5125,31 @@ PostgresMain(const char *dbname, const char *username)
 	 * were inside a transaction.
 	 */
 
+	#ifdef __PGLITE__
 	if (sigsetjmp(postgresmain_sigjmp_buf, 1) != 0)
+	#else
+	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
+	#endif
 	{
 		PostgresMainLongJmp();
 	}
 
 	/* We can now handle ereport(ERROR) */
-	PG_exception_stack = &postgresmain_sigjmp_buf;
-
+	#ifdef __PGLITE__
+	PostgresMainResetAfterLongJmp();
+	#else
+	PG_exception_stack = &local_sigjmp_buf;
 	if (!ignore_till_sync)
 		send_ready_for_query = true;	/* initially, or after error */
+	#endif
+
+#ifdef __PGLITE__
+	if (is_pglite_active != 0 && pglite_single_user_startup_mode != 0)
+	{
+		send_ready_for_query = false;
+		exit(PGLITE_EXIT_ALIVE);
+	}
+#endif
 
 	/*
 	 * Non-error queries loop here.

@@ -16,15 +16,20 @@
 
 #include <unistd.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/shm.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <time.h>
 #include <pwd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <setjmp.h>
+#include <signal.h>
 #include <string.h>
+
+#include "pglitec.h"
 
 #if defined(__EMSCRIPTEN__)
 #include <emscripten/emscripten.h>
@@ -34,6 +39,14 @@
 #endif
 
 volatile int is_pglite_active = 0;
+volatile int pglite_single_user_startup_mode = 0;
+volatile int pglite_direct_top_level_longjmp = 0;
+
+#define MAX_EXIT_TRAPS 16
+
+static sigjmp_buf pglite_exit_sigjmp_buf_stack[MAX_EXIT_TRAPS];
+static volatile sig_atomic_t pglite_exit_status_stack[MAX_EXIT_TRAPS];
+static volatile sig_atomic_t pglite_exit_trap_depth = 0;
 
 void EMSCRIPTEN_KEEPALIVE clear_setitimer(void) {
     struct itimerval zero = {{0, 0}, {0, 0}};
@@ -45,8 +58,53 @@ int pgl_setPGliteActive(int newValue) {
 	is_pglite_active = newValue;
     if (newValue == 0) {
         clear_setitimer();
-    }
+	}
 	return current;
+}
+
+int pgl_set_single_user_startup_mode(int newValue) {
+    int current = pglite_single_user_startup_mode;
+    pglite_single_user_startup_mode = newValue;
+    return current;
+}
+
+int pgl_set_direct_top_level_longjmp(int newValue) {
+    int current = pglite_direct_top_level_longjmp;
+    pglite_direct_top_level_longjmp = newValue;
+    return current;
+}
+
+int EMSCRIPTEN_KEEPALIVE
+pgl_enter_exit_trap(void) {
+    int trap_index;
+
+    if (pglite_exit_trap_depth >= MAX_EXIT_TRAPS) {
+        abort();
+    }
+
+    trap_index = pglite_exit_trap_depth++;
+    pglite_exit_status_stack[trap_index] = 0;
+    if (sigsetjmp(pglite_exit_sigjmp_buf_stack[trap_index], 1) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+int EMSCRIPTEN_KEEPALIVE
+pgl_get_exit_trap_status(void) {
+    if (pglite_exit_trap_depth <= 0) {
+        return 0;
+    }
+    return pglite_exit_status_stack[pglite_exit_trap_depth - 1];
+}
+
+void EMSCRIPTEN_KEEPALIVE
+pgl_leave_exit_trap(void) {
+    if (pglite_exit_trap_depth <= 0) {
+        return;
+    }
+    pglite_exit_trap_depth--;
+    pglite_exit_status_stack[pglite_exit_trap_depth] = 0;
 }
 
 /* ========== Top level exception handling ==========
@@ -70,10 +128,14 @@ volatile bool send_ready_for_query = false;
 */
 void EMSCRIPTEN_KEEPALIVE pgl_longjmp(jmp_buf env, int val) {
     if (is_pglite_active && memcmp(env, (void*)postgresmain_sigjmp_buf, sizeof(jmp_buf)) == 0) {
+        if (pglite_direct_top_level_longjmp) {
+            pglite_exit_trap_depth = 0;
+            longjmp(env, val);
+        }
         // reset this as it is expected
         if (!ignore_till_sync)
 		    send_ready_for_query = true;	/* initially, or after error */
-        exit(POSTGRES_MAIN_LONGJMP);
+        pgl_exit(POSTGRES_MAIN_LONGJMP);
     }
     longjmp(env, val);
 }
@@ -90,11 +152,10 @@ void EMSCRIPTEN_KEEPALIVE pgl_siglongjmp(sigjmp_buf env, int val) {
 * This is not available in emscripten atm, so we handle it manually
 * See pglite.ts in the frontend on how we emulate this instantiation.
 */
-typedef ssize_t (*pglite_system_t)(const char *command);
-pglite_system_t pglite_system = NULL;
+static pgl_system_t pglite_system = NULL;
 
 void EMSCRIPTEN_KEEPALIVE
-pgl_set_system_fn(pglite_system_t system_fn) {
+pgl_set_system_fn(pgl_system_t system_fn) {
     pglite_system = system_fn;
 }
 
@@ -108,11 +169,10 @@ pgl_system(const char *command) {
     return 123;
 }
 
-typedef FILE* (*pglite_popen_t)(const char *command, const char *mode);
-pglite_popen_t pglite_popen = NULL;
+static pgl_popen_t pglite_popen = NULL;
 
 void EMSCRIPTEN_KEEPALIVE
-pgl_set_popen_fn(pglite_popen_t popen_fn) {
+pgl_set_popen_fn(pgl_popen_t popen_fn) {
     pglite_popen = popen_fn;
 }
 
@@ -124,11 +184,10 @@ pgl_popen(const char *command, const char *mode) {
     return popen(command, mode);
 }
 
-typedef int (*pglite_pclose_t)(FILE* stream);
-pglite_pclose_t pglite_pclose = NULL;
+static pgl_pclose_t pglite_pclose = NULL;
 
 void EMSCRIPTEN_KEEPALIVE
-pgl_set_pclose_fn(pglite_pclose_t pclose_fn) {
+pgl_set_pclose_fn(pgl_pclose_t pclose_fn) {
     pglite_pclose = pclose_fn;
 }
 
@@ -207,6 +266,43 @@ void EMSCRIPTEN_KEEPALIVE pgl_run_atexit_funcs(void) {
     atexit_func_count = 0;
 }
 
+int EMSCRIPTEN_KEEPALIVE
+pgl_atexit_checkpoint(void) {
+    return atexit_func_count;
+}
+
+void EMSCRIPTEN_KEEPALIVE
+pgl_run_atexit_from(int checkpoint) {
+    if (checkpoint < 0) {
+        checkpoint = 0;
+    }
+    if (checkpoint > atexit_func_count) {
+        checkpoint = atexit_func_count;
+    }
+
+    for (int i = atexit_func_count - 1; i >= checkpoint; --i) {
+        if (atexit_funcs[i]) {
+            atexit_funcs[i]();
+        }
+    }
+    atexit_func_count = checkpoint;
+}
+
+void EMSCRIPTEN_KEEPALIVE
+pgl_discard_atexit_from(int checkpoint) {
+    if (checkpoint < 0) {
+        checkpoint = 0;
+    }
+    if (checkpoint > atexit_func_count) {
+        checkpoint = atexit_func_count;
+    }
+
+    for (int i = checkpoint; i < atexit_func_count; ++i) {
+        atexit_funcs[i] = NULL;
+    }
+    atexit_func_count = checkpoint;
+}
+
 /* ========== streams functions ==========
 *
 * initdb communicates with postgres via stdin<->stdout redirection
@@ -231,6 +327,10 @@ pgl_exit(int status) {
         pgl_stdout = NULL;
     }
     optind = 1;
+    if (pglite_exit_trap_depth > 0) {
+        pglite_exit_status_stack[pglite_exit_trap_depth - 1] = status;
+        siglongjmp(pglite_exit_sigjmp_buf_stack[pglite_exit_trap_depth - 1], 1);
+    }
     exit(status);
 }
 
@@ -358,7 +458,6 @@ pgl_shmctl(int shmid, int cmd, struct shmid_ds *buf) {
                 return 0;
             } else if (cmd == IPC_STAT && buf != NULL) {
                 buf->shm_segsz = seg->size;
-                buf->shm_perm.__key = seg->key;
                 buf->shm_nattch = 0;
                 buf->shm_atime = buf->shm_dtime = buf->shm_ctime = time(NULL);
                 return 0;
@@ -404,13 +503,11 @@ pgl_munmap(void *addr, size_t length) {
 * read FROM JS
 * Callback used for reading data from the frontend
 */
-typedef ssize_t (*pgl_read_t)(void *buffer, size_t max_length);
 pgl_read_t pgl_read;
 
 /* write TO JS
 * Callback used for writing data to the frontend
 */
-typedef ssize_t (*pgl_write_t)(void *buffer, size_t length);
 pgl_write_t pgl_write;
 
 /*
