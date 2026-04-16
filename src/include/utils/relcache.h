@@ -98,6 +98,7 @@ extern int	errtableconstraint(Relation rel, const char *conname);
 extern void RelationCacheInitialize(void);
 extern void RelationCacheInitializePhase2(void);
 extern void RelationCacheInitializePhase3(void);
+extern void PGliteResetRelcache(void);
 
 /*
  * Routine to create a relcache entry for an about-to-be-created relation

@@ -923,6 +923,50 @@ InitFileAccess(void)
 }
 
 /*
+ * Reset file-access globals so another standalone backend can start inside
+ * the same process.  This is only used by the embedded pglite initdb path.
+ */
+void
+PGliteResetFileAccess(void)
+{
+	Index		i;
+
+	if (allocatedDescs != NULL)
+	{
+		while (numAllocatedDescs > 0)
+			FreeDesc(&allocatedDescs[0]);
+		free(allocatedDescs);
+		allocatedDescs = NULL;
+	}
+
+	if (SizeVfdCache > 0)
+	{
+		closeAllVfds();
+		for (i = 1; i < SizeVfdCache; i++)
+		{
+			if (VfdCache[i].fileName != NULL)
+				free(VfdCache[i].fileName);
+		}
+		free(VfdCache);
+		VfdCache = NULL;
+	}
+
+	SizeVfdCache = 0;
+	nfile = 0;
+	have_xact_temporary_files = false;
+	temporary_files_size = 0;
+#ifdef USE_ASSERT_CHECKING
+	temporary_files_allowed = false;
+#endif
+	numAllocatedDescs = 0;
+	maxAllocatedDescs = 0;
+	numExternalFDs = 0;
+	tempTableSpaces = NULL;
+	numTempTableSpaces = -1;
+	nextTempTableSpace = 0;
+}
+
+/*
  * InitTemporaryFileAccess --- initialize temporary file access during startup
  *
  * This is called during either normal or standalone backend start.

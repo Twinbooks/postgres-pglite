@@ -16,7 +16,7 @@ PGLITE_BUILD_CFLAGS ?= $(CFLAGS)
 PGLITEC_CFLAGS = $(filter-out $(PGLITE_REMAP_CFLAGS),$(PGLITE_BUILD_CFLAGS))
 PGLITE_FRONTEND_CFLAGS = $(filter-out $(PGLITE_REMAP_CFLAGS),$(PGLITE_BUILD_CFLAGS))
 STRINGINFO_REMAP_CFLAGS = -DmakeStringInfo=pgl_makeStringInfo -DinitStringInfo=pgl_initStringInfo -DresetStringInfo=pgl_resetStringInfo -DappendStringInfo=pgl_appendStringInfo -DappendStringInfoVA=pgl_appendStringInfoVA -DappendStringInfoString=pgl_appendStringInfoString -DappendStringInfoChar=pgl_appendStringInfoChar -DappendStringInfoSpaces=pgl_appendStringInfoSpaces -DappendBinaryStringInfo=pgl_appendBinaryStringInfo -DappendBinaryStringInfoNT=pgl_appendBinaryStringInfoNT -DenlargeStringInfo=pgl_enlargeStringInfo -DdestroyStringInfo=pgl_destroyStringInfo -Dpalloc=pg_malloc -Dpfree=pg_free -Drepalloc=pg_realloc -Dpvsnprintf=pgl_pvsnprintf
-INITDB_CPPFLAGS = -DFRONTEND -DUSE_PRIVATE_ENCODING_FUNCS -I$(libpq_srcdir) -I$(top_srcdir)/src/timezone $(ICU_CFLAGS)
+INITDB_CPPFLAGS = -D__PGLITE__ -DFRONTEND -DUSE_PRIVATE_ENCODING_FUNCS -I$(libpq_srcdir) -I$(top_srcdir)/src/timezone $(ICU_CFLAGS)
 INITDB_REMAP_CFLAGS = $(PGLITE_REMAP_CFLAGS) $(STRINGINFO_REMAP_CFLAGS) -Dsystem=pgl_system -Dpopen=pgl_popen -Dpclose=pgl_pclose -Dgeteuid=pgl_geteuid -Dgetuid=pgl_getuid -Dgetpwuid=pgl_getpwuid -Dpalloc=pg_malloc -Dpalloc0=pg_malloc0 -Dpalloc_extended=pg_malloc_extended -Dpfree=pg_free -Dpstrdup=pg_strdup -Dpnstrdup=pgl_pnstrdup -Drepalloc=pg_realloc -Dpsprintf=pgl_psprintf -Dpvsnprintf=pgl_pvsnprintf -Dmain=pglite_initdb_main
 INITDB_FINDTIMEZONE_CPPFLAGS = $(INITDB_CPPFLAGS) -Dpg_open_tzfile=pglite_pg_open_tzfile
 FRONTEND_OBJS = pglite_stringinfo.o

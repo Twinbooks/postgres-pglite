@@ -711,10 +711,22 @@ CreateCacheMemoryContext(void)
 	 * Purely for paranoia, check that context doesn't exist; caller probably
 	 * did so already.
 	 */
-	if (!CacheMemoryContext)
-		CacheMemoryContext = AllocSetContextCreate(TopMemoryContext,
-												   "CacheMemoryContext",
-												   ALLOCSET_DEFAULT_SIZES);
+		if (!CacheMemoryContext)
+			CacheMemoryContext = AllocSetContextCreate(TopMemoryContext,
+													   "CacheMemoryContext",
+													   ALLOCSET_DEFAULT_SIZES);
+}
+
+/*
+ * Reset backend-local catcache registrations so another standalone backend can
+ * start inside the same process.  This intentionally drops references to the
+ * old cache objects; embedded initdb only needs a clean restart point.
+ */
+void
+PGliteResetCatCache(void)
+{
+	CacheHdr = NULL;
+	catcache_in_progress_stack = NULL;
 }
 
 

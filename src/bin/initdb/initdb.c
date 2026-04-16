@@ -83,8 +83,6 @@
 #include "miscadmin.h"
 
 #ifdef __PGLITE__
-extern int pglite_embedded_initdb_mode;
-
 static void
 pglite_append_shell_string(PQExpBuffer buf, const char *str)
 {
@@ -106,6 +104,12 @@ pglite_simple_prompt(const char *prompt, bool echo)
 {
 	pg_fatal("embedded initdb does not support interactive prompts");
 	return NULL;
+}
+
+static bool
+pglite_embedded_initdb_enabled(void)
+{
+	return getenv("PGLITE_EMBEDDED_INITDB") != NULL;
 }
 
 #define appendShellString pglite_append_shell_string
@@ -352,11 +356,47 @@ do { \
 		exit(1); /* message already printed by popen_check */ \
 } while (0)
 
+#ifdef __PGLITE__
+static int
+pglite_pclose_check(FILE *stream)
+{
+	int			exitstatus;
+	char	   *reason;
+
+	exitstatus = pclose(stream);
+
+	if (exitstatus == 0)
+		return 0;
+
+	if (exitstatus == -1)
+		pg_log_error("%s() failed: %m", "pclose");
+	else
+	{
+		reason = wait_result_to_str(exitstatus);
+		pg_log_error("%s", reason);
+		/*
+		 * In the embedded libpglite build, wait_result_to_str() can come from
+		 * the backend-side common library rather than the frontend one, so its
+		 * allocation semantics are not reliable here.  This branch is only
+		 * reached on fatal error and the caller exits immediately afterward, so
+		 * avoid freeing the message buffer.
+		 */
+	}
+
+	return exitstatus;
+}
+#define PG_CMD_CLOSE() \
+do { \
+	if (pglite_pclose_check(cmdfd)) \
+		exit(1); /* message already printed by pglite_pclose_check */ \
+} while (0)
+#else
 #define PG_CMD_CLOSE() \
 do { \
 	if (pclose_check(cmdfd)) \
 		exit(1); /* message already printed by pclose_check */ \
 } while (0)
+#endif
 
 #define PG_CMD_PUTS(line) \
 do { \
@@ -1233,7 +1273,7 @@ static bool
 test_specific_config_settings(int test_conns, int test_buffs)
 {
 #ifdef __PGLITE__
-	if (pglite_embedded_initdb_mode != 0)
+	if (pglite_embedded_initdb_enabled())
 		return true;
 #endif
 
@@ -2661,10 +2701,13 @@ void
 setup_bin_paths(const char *argv0)
 {
 #ifdef __PGLITE__
-	if (pglite_embedded_initdb_mode != 0)
+	if (pglite_embedded_initdb_enabled())
 	{
-		if (find_my_exec(argv0, backend_exec) < 0)
-			pg_fatal("embedded initdb could not resolve backend executable \"%s\"", argv0);
+		if (!is_absolute_path(argv0))
+			pg_fatal("embedded initdb requires an absolute backend path, got \"%s\"", argv0);
+
+		strlcpy(backend_exec, argv0, MAXPGPATH);
+		canonicalize_path(backend_exec);
 
 		strcpy(bin_path, backend_exec);
 		*last_dir_separator(bin_path) = '\0';

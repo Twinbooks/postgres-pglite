@@ -75,7 +75,7 @@ int pgl_set_direct_top_level_longjmp(int newValue) {
 }
 
 int EMSCRIPTEN_KEEPALIVE
-pgl_enter_exit_trap(void) {
+pgl_push_exit_trap(sigjmp_buf **buf_out) {
     int trap_index;
 
     if (pglite_exit_trap_depth >= MAX_EXIT_TRAPS) {
@@ -84,27 +84,30 @@ pgl_enter_exit_trap(void) {
 
     trap_index = pglite_exit_trap_depth++;
     pglite_exit_status_stack[trap_index] = 0;
-    if (sigsetjmp(pglite_exit_sigjmp_buf_stack[trap_index], 1) != 0) {
-        return 1;
+    if (buf_out != NULL) {
+        *buf_out = &pglite_exit_sigjmp_buf_stack[trap_index];
     }
-    return 0;
+    return trap_index;
 }
 
 int EMSCRIPTEN_KEEPALIVE
-pgl_get_exit_trap_status(void) {
-    if (pglite_exit_trap_depth <= 0) {
+pgl_get_exit_trap_status_at(int trap_index) {
+    if (trap_index < 0 || trap_index >= MAX_EXIT_TRAPS) {
         return 0;
     }
-    return pglite_exit_status_stack[pglite_exit_trap_depth - 1];
+    return pglite_exit_status_stack[trap_index];
 }
 
 void EMSCRIPTEN_KEEPALIVE
-pgl_leave_exit_trap(void) {
-    if (pglite_exit_trap_depth <= 0) {
+pgl_pop_exit_trap(int trap_index) {
+    if (trap_index < 0 || trap_index >= MAX_EXIT_TRAPS) {
         return;
     }
-    pglite_exit_trap_depth--;
-    pglite_exit_status_stack[pglite_exit_trap_depth] = 0;
+    if (pglite_exit_trap_depth <= trap_index) {
+        return;
+    }
+    pglite_exit_trap_depth = trap_index;
+    pglite_exit_status_stack[trap_index] = 0;
 }
 
 /* ========== Top level exception handling ==========

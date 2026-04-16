@@ -44,6 +44,14 @@ bool		proc_exit_inprogress = false;
  */
 bool		shmem_exit_inprogress = false;
 
+void
+PGliteResetProcExit(void)
+{
+	proc_exit_inprogress = false;
+	shmem_exit_inprogress = false;
+	ExitOnAnyError = false;
+}
+
 /*
  * This flag tracks whether we've called atexit() in the current process
  * (or in the parent postmaster).

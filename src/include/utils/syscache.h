@@ -24,6 +24,7 @@
 
 extern void InitCatalogCache(void);
 extern void InitCatalogCachePhase2(void);
+extern void PGliteResetSysCache(void);
 
 extern HeapTuple SearchSysCache(int cacheId,
 								Datum key1, Datum key2, Datum key3, Datum key4);

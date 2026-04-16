@@ -209,7 +209,14 @@ InitStandaloneProcess(const char *argv0)
 	/* Compute paths, no postmaster to inherit from */
 	if (my_exec_path[0] == '\0')
 	{
-		if (find_my_exec(argv0, my_exec_path) < 0)
+		if (getenv("PGLITE_EMBEDDED_INITDB") != NULL &&
+			argv0 != NULL &&
+			is_absolute_path(argv0))
+		{
+			strlcpy(my_exec_path, argv0, MAXPGPATH);
+			canonicalize_path(my_exec_path);
+		}
+		else if (find_my_exec(argv0, my_exec_path) < 0)
 			elog(FATAL, "%s: could not locate my own executable path",
 				 argv0);
 	}

@@ -42,6 +42,11 @@
 #include "utils/relmapper.h"
 
 uint32		bootstrap_data_checksum_version = 0;	/* No checksum */
+FILE	   *PGliteBootstrapInputFile = NULL;
+
+extern FILE *boot_yyin;
+extern int	boot_yylineno;
+extern void boot_yyrestart(FILE *input_file);
 
 
 static void CheckerModeMain(void);
@@ -354,6 +359,11 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	 * Process bootstrap input.
 	 */
 	StartTransactionCommand();
+	boot_yyin = PGliteBootstrapInputFile != NULL ? PGliteBootstrapInputFile : stdin;
+	clearerr(boot_yyin);
+	(void) fseek(boot_yyin, 0, SEEK_SET);
+	boot_yyrestart(boot_yyin);
+	boot_yylineno = 1;
 	boot_yyparse();
 	CommitTransactionCommand();
 

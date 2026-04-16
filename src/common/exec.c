@@ -44,6 +44,14 @@
 
 #include "common/string.h"
 
+static bool
+pglite_use_direct_exec_path(const char *argv0)
+{
+	return argv0 != NULL &&
+		is_absolute_path(argv0) &&
+		getenv("PGLITE_EMBEDDED_INITDB") != NULL;
+}
+
 /* Inhibit mingw CRT's auto-globbing of command line arguments */
 #if defined(WIN32) && !defined(_MSC_VER)
 extern int	_CRT_glob = 0;		/* 0 turns off globbing; 1 turns it on */
@@ -466,6 +474,12 @@ set_pglocale_pgservice(const char *argv0, const char *app)
 		 */
 	}
 
+	if (pglite_use_direct_exec_path(argv0))
+	{
+		strlcpy(my_exec_path, argv0, sizeof(my_exec_path));
+		canonicalize_path(my_exec_path);
+	}
+	else
 	if (find_my_exec(argv0, my_exec_path) < 0)
 		return;
 

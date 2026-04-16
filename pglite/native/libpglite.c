@@ -15,6 +15,7 @@
 
 #include "libpq/libpq.h"
 #include "miscadmin.h"
+#include "pg_getopt.h"
 #include "port.h"
 #include "tcop/backend_startup.h"
 #include "tcop/tcopprot.h"
@@ -28,10 +29,22 @@
 
 extern int main(int argc, char *argv[]);
 extern int pglite_initdb_main(int argc, char *argv[]);
+extern FILE *PGliteBootstrapInputFile;
+extern FILE *PGliteSingleUserInputFile;
+extern void PGliteResetFileAccess(void);
+extern void PGliteResetProcExit(void);
+extern void PGliteResetSmgr(void);
+extern void PGliteResetRelcache(void);
+extern void PGliteResetSysCache(void);
 extern void pgl_startPGlite(void);
 extern void pgl_pq_flush(void);
 extern void pgl_sendConnData(void);
 extern Port *pgl_getMyProcPort(void);
+extern int ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done);
+extern void PostgresSendReadyForQueryIfNecessary(void);
+extern void PostgresMainResetAfterLongJmp(void);
+extern void PostgresMainLoopOnce(void);
+extern void PostgresMainLongJmp(void);
 extern int pgl_set_single_user_startup_mode(int newValue);
 extern int pgl_set_direct_top_level_longjmp(int newValue);
 extern sigjmp_buf postgresmain_sigjmp_buf;
@@ -53,7 +66,6 @@ struct PGlite {
 
 static PGlite *active_db = NULL;
 static char *global_error = NULL;
-int pglite_embedded_initdb_mode = 0;
 
 typedef struct EmbeddedInitdbCommand {
     FILE *stream;
@@ -75,6 +87,14 @@ static EmbeddedInitdbContext *active_initdb_context = NULL;
 
 static void initialize_installation_paths(void);
 static char *read_stream_excerpt(FILE *stream);
+
+static void
+reset_getopt_state(void) {
+    optind = 1;
+#ifdef HAVE_INT_OPTRESET
+    optreset = 1;
+#endif
+}
 
 char *
 pg_strdup(const char *in) {
@@ -534,7 +554,10 @@ end_output_capture(FILE **capture_stream, int *saved_stdout, int *saved_stderr) 
 
 static char *
 read_stream_excerpt(FILE *stream) {
+    static const size_t max_excerpt = 32768;
     char *buffer;
+    long offset;
+    long size;
     size_t len;
     size_t nread;
 
@@ -545,18 +568,26 @@ read_stream_excerpt(FILE *stream) {
     if (fflush(stream) != 0) {
         return NULL;
     }
-    if (fseek(stream, 0, SEEK_SET) != 0) {
+    if (fseek(stream, 0, SEEK_END) != 0) {
+        return NULL;
+    }
+    size = ftell(stream);
+    if (size < 0) {
+        return NULL;
+    }
+    offset = size > (long) max_excerpt ? size - (long) max_excerpt : 0;
+    if (fseek(stream, offset, SEEK_SET) != 0) {
         return NULL;
     }
 
-    buffer = malloc(4097);
+    buffer = malloc(max_excerpt + 1);
     if (buffer == NULL) {
         return NULL;
     }
 
     len = 0;
-    while (len < 4096) {
-        nread = fread(buffer + len, 1, 4096 - len, stream);
+    while (len < max_excerpt) {
+        nread = fread(buffer + len, 1, max_excerpt - len, stream);
         len += nread;
         if (nread == 0) {
             break;
@@ -1055,9 +1086,10 @@ run_embedded_backend_command(PGlite *db, const char *command, FILE *input_stream
     int exec_argc;
     int i;
     int rc;
-    int trapped;
-    int status;
+    sigjmp_buf *exit_trap;
+    volatile int status;
     int checkpoint;
+    int trap_index;
     int saved_stdin;
     int saved_stdout;
     int saved_stderr;
@@ -1071,9 +1103,10 @@ run_embedded_backend_command(PGlite *db, const char *command, FILE *input_stream
     parsed_argc = 0;
     exec_argc = 0;
     rc = -1;
-    trapped = 0;
+    exit_trap = NULL;
     status = 0;
     checkpoint = 0;
+    trap_index = -1;
     saved_stdin = -1;
     saved_stdout = -1;
     saved_stderr = -1;
@@ -1127,7 +1160,6 @@ run_embedded_backend_command(PGlite *db, const char *command, FILE *input_stream
         set_db_error(db, "failed to prepare embedded initdb input stream: %s", strerror(errno));
         goto done;
     }
-
     capture_stream = tmpfile();
     if (capture_stream == NULL) {
         set_db_error(db, "failed to create embedded initdb capture stream: %s", strerror(errno));
@@ -1157,14 +1189,38 @@ run_embedded_backend_command(PGlite *db, const char *command, FILE *input_stream
         goto done;
     }
 
+    /*
+     * The backend reuses the process-global stdio streams. After redirecting
+     * the underlying file descriptors, clear any stale EOF/error state so
+     * single-user mode will actually consume the redirected input stream.
+     */
+    clearerr(stdin);
+    clearerr(stdout);
+    clearerr(stderr);
+
     checkpoint = pgl_atexit_checkpoint();
-    trapped = pgl_enter_exit_trap();
-    if (!trapped) {
+    trap_index = pgl_push_exit_trap(&exit_trap);
+	    if (sigsetjmp(*exit_trap, 1) == 0) {
+	        reset_getopt_state();
+	        if (exec_argc > 1 && strcmp(exec_argv[1], "--boot") == 0) {
+	            PGliteBootstrapInputFile = input_stream;
+	        } else if (exec_argc > 1 && strcmp(exec_argv[1], "--single") == 0) {
+	            PGliteSingleUserInputFile = input_stream;
+	            PGliteResetProcExit();
+	            PGliteResetSmgr();
+	            PGliteResetRelcache();
+	            PGliteResetSysCache();
+	            PGliteResetFileAccess();
+	        }
         status = main(exec_argc, exec_argv);
-        pgl_leave_exit_trap();
+        PGliteBootstrapInputFile = NULL;
+        PGliteSingleUserInputFile = NULL;
+        pgl_pop_exit_trap(trap_index);
     } else {
-        status = pgl_get_exit_trap_status();
-        pgl_leave_exit_trap();
+        status = pgl_get_exit_trap_status_at(trap_index);
+        PGliteBootstrapInputFile = NULL;
+        PGliteSingleUserInputFile = NULL;
+        pgl_pop_exit_trap(trap_index);
     }
 
     pgl_run_atexit_from(checkpoint);
@@ -1333,43 +1389,65 @@ embedded_initdb_pclose(FILE *stream) {
 static int
 run_embedded_initdb(PGlite *db) {
     char pg_version_path[MAXPGPATH];
-    char *argv[] = {
-        my_exec_path,
-        "-D",
-        db->data_dir,
-        "-A",
-        "trust",
-        "-U",
-        "postgres",
-        "--no-instructions",
-        NULL,
-    };
+    char share_dir[MAXPGPATH];
+    char *argv[20];
+    char *saved_embedded_env;
     int argc;
     int checkpoint;
-    int trapped;
-    int status;
+    int previous_pglite_active;
+    sigjmp_buf *exit_trap;
+    volatile int status;
     int saved_stdout;
     int saved_stderr;
     char *capture_text;
     FILE *capture_stream;
+    int trap_index;
     EmbeddedInitdbContext ctx;
+    bool restore_pglite_active;
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.db = db;
-    argc = (int) (sizeof(argv) / sizeof(argv[0])) - 1;
+    initialize_installation_paths();
+    build_runtime_dir(share_dir, sizeof(share_dir), "share", PGSHAREDIR);
+    argc = 0;
+    argv[argc++] = my_exec_path;
+    argv[argc++] = "-D";
+    argv[argc++] = db->data_dir;
+    argv[argc++] = "-A";
+    argv[argc++] = "trust";
+    argv[argc++] = "-U";
+    argv[argc++] = "postgres";
+    argv[argc++] = "-L";
+    argv[argc++] = share_dir;
+    argv[argc++] = "--locale=C";
+    argv[argc++] = "--encoding=UTF8";
+    argv[argc++] = "--no-instructions";
+    argv[argc] = NULL;
     saved_stdout = -1;
     saved_stderr = -1;
     capture_text = NULL;
     capture_stream = NULL;
-
-    initialize_installation_paths();
+    exit_trap = NULL;
+    trap_index = -1;
+    saved_embedded_env = NULL;
+    previous_pglite_active = 0;
+    restore_pglite_active = false;
 
     checkpoint = pgl_atexit_checkpoint();
-    pglite_embedded_initdb_mode = 1;
+    if (getenv("PGLITE_EMBEDDED_INITDB") != NULL) {
+        saved_embedded_env = pg_strdup(getenv("PGLITE_EMBEDDED_INITDB"));
+    }
+    if (setenv("PGLITE_EMBEDDED_INITDB", "1", 1) != 0) {
+        set_db_error(db, "failed to set embedded initdb environment: %s", strerror(errno));
+        status = -1;
+        goto done;
+    }
     active_initdb_context = &ctx;
     pgl_set_system_fn(embedded_initdb_system);
     pgl_set_popen_fn(embedded_initdb_popen);
     pgl_set_pclose_fn(embedded_initdb_pclose);
+    previous_pglite_active = pgl_setPGliteActive(0);
+    restore_pglite_active = true;
 
     if (begin_output_capture(&capture_stream, &saved_stdout, &saved_stderr) != 0) {
         set_db_error(db, "failed to capture embedded initdb output: %s", strerror(errno));
@@ -1377,13 +1455,14 @@ run_embedded_initdb(PGlite *db) {
         goto done;
     }
 
-    trapped = pgl_enter_exit_trap();
-    if (!trapped) {
+    trap_index = pgl_push_exit_trap(&exit_trap);
+    if (sigsetjmp(*exit_trap, 1) == 0) {
+        reset_getopt_state();
         status = pglite_initdb_main(argc, argv);
-        pgl_leave_exit_trap();
+        pgl_pop_exit_trap(trap_index);
     } else {
-        status = pgl_get_exit_trap_status();
-        pgl_leave_exit_trap();
+        status = pgl_get_exit_trap_status_at(trap_index);
+        pgl_pop_exit_trap(trap_index);
     }
     capture_text = end_output_capture(&capture_stream, &saved_stdout, &saved_stderr);
 
@@ -1397,9 +1476,16 @@ done:
     pgl_set_pclose_fn(NULL);
     pgl_set_popen_fn(NULL);
     pgl_set_system_fn(NULL);
+    if (restore_pglite_active)
+        pgl_setPGliteActive(previous_pglite_active);
     active_initdb_context = NULL;
-    pglite_embedded_initdb_mode = 0;
+    if (saved_embedded_env != NULL) {
+        (void) setenv("PGLITE_EMBEDDED_INITDB", saved_embedded_env, 1);
+    } else {
+        (void) unsetenv("PGLITE_EMBEDDED_INITDB");
+    }
     cleanup_embedded_initdb_context(&ctx);
+    free(saved_embedded_env);
 
     if (status != 0) {
         if (db->error == NULL || db->error[0] == '\0') {
@@ -1530,15 +1616,18 @@ run_single_user_main(PGlite *db) {
     int argc = (int) (sizeof(argv) / sizeof(argv[0])) - 1;
     int saved_stdout;
     int saved_stderr;
-    int trapped;
-    int status;
+    sigjmp_buf *exit_trap;
+    volatile int status;
     char *capture_text;
     FILE *capture_stream;
+    int trap_index;
 
     saved_stdout = -1;
     saved_stderr = -1;
     capture_text = NULL;
     capture_stream = NULL;
+    exit_trap = NULL;
+    trap_index = -1;
 
     snprintf(pg_version_path, sizeof(pg_version_path), "%s/PG_VERSION", db->data_dir);
     if (!file_exists(pg_version_path)) {
@@ -1558,18 +1647,24 @@ run_single_user_main(PGlite *db) {
         pgl_set_single_user_startup_mode(0);
         return -1;
     }
-    trapped = pgl_enter_exit_trap();
-    if (!trapped) {
-        (void) main(argc, argv);
-        pgl_set_single_user_startup_mode(0);
-        pgl_leave_exit_trap();
+	    trap_index = pgl_push_exit_trap(&exit_trap);
+	    if (sigsetjmp(*exit_trap, 1) == 0) {
+	        reset_getopt_state();
+	        PGliteResetProcExit();
+	        PGliteResetSmgr();
+	        PGliteResetRelcache();
+	        PGliteResetSysCache();
+	        PGliteResetFileAccess();
+	        (void) main(argc, argv);
+	        pgl_set_single_user_startup_mode(0);
+	        pgl_pop_exit_trap(trap_index);
         free(end_output_capture(&capture_stream, &saved_stdout, &saved_stderr));
         return 0;
     }
 
-    status = pgl_get_exit_trap_status();
+    status = pgl_get_exit_trap_status_at(trap_index);
     pgl_set_single_user_startup_mode(0);
-    pgl_leave_exit_trap();
+    pgl_pop_exit_trap(trap_index);
     capture_text = end_output_capture(&capture_stream, &saved_stdout, &saved_stderr);
     if (status != 0 && status != 99) {
         if (capture_text != NULL) {
@@ -1587,9 +1682,10 @@ run_single_user_main(PGlite *db) {
 
 static int
 process_startup_packet(PGlite *db, const char *message, size_t message_len) {
-    int trapped;
-    int status;
+    sigjmp_buf *exit_trap;
+    volatile int status;
     int result;
+    int trap_index;
 
     if (message_len < 8) {
         set_db_error(db, "startup packet is too short");
@@ -1598,13 +1694,14 @@ process_startup_packet(PGlite *db, const char *message, size_t message_len) {
 
     reset_io(db, (const unsigned char *) message, message_len);
 
-    trapped = pgl_enter_exit_trap();
-    if (!trapped) {
+    exit_trap = NULL;
+    trap_index = pgl_push_exit_trap(&exit_trap);
+    if (sigsetjmp(*exit_trap, 1) == 0) {
         result = ProcessStartupPacket(pgl_getMyProcPort(), true, true);
-        pgl_leave_exit_trap();
+        pgl_pop_exit_trap(trap_index);
     } else {
-        status = pgl_get_exit_trap_status();
-        pgl_leave_exit_trap();
+        status = pgl_get_exit_trap_status_at(trap_index);
+        pgl_pop_exit_trap(trap_index);
         set_db_error(db, "startup packet processing exited with status %d", status);
         return -1;
     }
@@ -1621,14 +1718,17 @@ process_startup_packet(PGlite *db, const char *message, size_t message_len) {
 
 static int
 process_query_message(PGlite *db, const char *message, size_t message_len) {
-    int trapped;
-    int status;
+    sigjmp_buf *exit_trap;
+    volatile int status;
 
     reset_io(db, (const unsigned char *) message, message_len);
+    exit_trap = NULL;
 
     while (db->input_offset < db->input_len || pq_buffer_remaining_data() > 0) {
         int old_direct_top_level_longjmp;
+        int trap_index;
 
+        PGliteResetProcExit();
         PG_exception_stack = &postgresmain_sigjmp_buf;
         old_direct_top_level_longjmp = pgl_set_direct_top_level_longjmp(1);
         if (sigsetjmp(postgresmain_sigjmp_buf, 1) != 0) {
@@ -1638,19 +1738,20 @@ process_query_message(PGlite *db, const char *message, size_t message_len) {
             continue;
         }
 
-        trapped = pgl_enter_exit_trap();
-        if (!trapped) {
+        trap_index = pgl_push_exit_trap(&exit_trap);
+        if (sigsetjmp(*exit_trap, 1) == 0) {
             PostgresMainLoopOnce();
-            pgl_leave_exit_trap();
+            pgl_pop_exit_trap(trap_index);
             pgl_set_direct_top_level_longjmp(old_direct_top_level_longjmp);
             continue;
         }
 
-        status = pgl_get_exit_trap_status();
-        pgl_leave_exit_trap();
+        status = pgl_get_exit_trap_status_at(trap_index);
+        pgl_pop_exit_trap(trap_index);
         pgl_set_direct_top_level_longjmp(old_direct_top_level_longjmp);
 
-        if (status == 100) {
+        if (status == 100 || status == 1) {
+            PGliteResetProcExit();
             PostgresMainLongJmp();
             PostgresMainResetAfterLongJmp();
             continue;
@@ -1670,8 +1771,9 @@ pglite_open_with_options(const char *data_dir, const char *bootstrap_mode, PGlit
     PGlite *db;
     PGliteBootstrapMode resolved_bootstrap_mode;
     const char *resolved_bootstrap_mode_value;
-    int trapped;
-    int status;
+    sigjmp_buf *exit_trap;
+    volatile int status;
+    int trap_index;
 
     *out_db = NULL;
 
@@ -1711,20 +1813,13 @@ pglite_open_with_options(const char *data_dir, const char *bootstrap_mode, PGlit
         return -1;
     }
 
-    if (bootstrap_data_dir(db, resolved_bootstrap_mode) != 0) {
-        set_global_error("%s", db->error != NULL ? db->error : "native bootstrap failed");
-        free(db->data_dir);
-        free(db->error);
-        free(db);
-        return -1;
-    }
-
     active_db = db;
     pgl_set_rw_cbs(embedded_read, embedded_write);
     pgl_setPGliteActive(1);
 
-    if (run_single_user_main(db) != 0) {
-        set_global_error("%s", db->error != NULL ? db->error : "native startup failed");
+    if (bootstrap_data_dir(db, resolved_bootstrap_mode) != 0) {
+        set_global_error("%s", db->error != NULL ? db->error : "native bootstrap failed");
+        pgl_setPGliteActive(0);
         active_db = NULL;
         free(db->data_dir);
         free(db->error);
@@ -1732,14 +1827,26 @@ pglite_open_with_options(const char *data_dir, const char *bootstrap_mode, PGlit
         return -1;
     }
 
-    trapped = pgl_enter_exit_trap();
-    if (!trapped) {
+    if (run_single_user_main(db) != 0) {
+        set_global_error("%s", db->error != NULL ? db->error : "native startup failed");
+        pgl_setPGliteActive(0);
+        active_db = NULL;
+        free(db->data_dir);
+        free(db->error);
+        free(db);
+        return -1;
+    }
+
+    exit_trap = NULL;
+    trap_index = pgl_push_exit_trap(&exit_trap);
+    if (sigsetjmp(*exit_trap, 1) == 0) {
         pgl_startPGlite();
-        pgl_leave_exit_trap();
+        pgl_pop_exit_trap(trap_index);
     } else {
-        status = pgl_get_exit_trap_status();
-        pgl_leave_exit_trap();
+        status = pgl_get_exit_trap_status_at(trap_index);
+        pgl_pop_exit_trap(trap_index);
         set_global_error("pgl_startPGlite exited with status %d", status);
+        pgl_setPGliteActive(0);
         active_db = NULL;
         free(db->output_data);
         free(db->data_dir);
@@ -1831,8 +1938,9 @@ pglite_exec(PGlite *db, const char *sql, char **out_data, size_t *out_len) {
 int
 pglite_close(PGlite *db) {
     static const unsigned char terminate_message[] = { 'X', 0, 0, 0, 4 };
-    int trapped;
-    int status;
+    sigjmp_buf *exit_trap;
+    volatile int status;
+    int trap_index;
 
     if (db == NULL || db->closed) {
         return 0;
@@ -1842,13 +1950,14 @@ pglite_close(PGlite *db) {
     pgl_setPGliteActive(0);
     reset_io(db, terminate_message, sizeof(terminate_message));
 
-    trapped = pgl_enter_exit_trap();
-    if (!trapped) {
+    exit_trap = NULL;
+    trap_index = pgl_push_exit_trap(&exit_trap);
+    if (sigsetjmp(*exit_trap, 1) == 0) {
         PostgresMainLoopOnce();
-        pgl_leave_exit_trap();
+        pgl_pop_exit_trap(trap_index);
     } else {
-        status = pgl_get_exit_trap_status();
-        pgl_leave_exit_trap();
+        status = pgl_get_exit_trap_status_at(trap_index);
+        pgl_pop_exit_trap(trap_index);
         if (status != 0) {
             set_db_error(db, "unexpected close exit status %d", status);
             return -1;

@@ -38,9 +38,9 @@ uid_t pgl_geteuid(void);
 uid_t pgl_getuid(void);
 struct passwd *pgl_getpwuid(uid_t uid);
 
-int pgl_enter_exit_trap(void);
-int pgl_get_exit_trap_status(void);
-void pgl_leave_exit_trap(void);
+int pgl_push_exit_trap(sigjmp_buf **buf_out);
+int pgl_get_exit_trap_status_at(int trap_index);
+void pgl_pop_exit_trap(int trap_index);
 
 #ifdef __cplusplus
 }

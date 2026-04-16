@@ -181,6 +181,24 @@ smgrshutdown(int code, Datum arg)
 }
 
 /*
+ * Reset backend-local smgr state so another standalone backend can start in
+ * the same host process.  This is only used by the embedded pglite initdb
+ * path, where backend exit does not discard process memory for us.
+ */
+void
+PGliteResetSmgr(void)
+{
+	if (SMgrRelationHash != NULL)
+	{
+		smgrreleaseall();
+		hash_destroy(SMgrRelationHash);
+		SMgrRelationHash = NULL;
+	}
+
+	dlist_init(&unpinned_relns);
+}
+
+/*
  * smgropen() -- Return an SMgrRelation object, creating it if need be.
  *
  * In versions of PostgreSQL prior to 17, this function returned an object

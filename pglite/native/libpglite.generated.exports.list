@@ -2186,6 +2186,13 @@ _PGSharedMemoryIsInUse
 _PG_char_to_encoding
 _PG_encoding_to_char
 _PG_exception_stack
+_PGliteBootstrapInputFile
+_PGliteResetCatCache
+_PGliteResetFileAccess
+_PGliteResetProcExit
+_PGliteResetRelcache
+_PGliteResetSmgr
+_PGliteResetSysCache
 _PMSignalShmemInit
 _PMSignalShmemSize
 _PageAddItemExtended

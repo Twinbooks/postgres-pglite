@@ -4029,6 +4029,25 @@ RelationCacheInitialize(void)
 }
 
 /*
+ * Reset backend-local relcache bookkeeping so another standalone backend can
+ * start inside the same process.  Embedded initdb uses this between its two
+ * backend phases.
+ */
+void
+PGliteResetRelcache(void)
+{
+	RelationIdCache = NULL;
+	criticalRelcachesBuilt = false;
+	criticalSharedRelcachesBuilt = false;
+	relcacheInvalsReceived = 0;
+	in_progress_list = NULL;
+	in_progress_list_len = 0;
+	in_progress_list_maxlen = 0;
+	eoxact_list_len = 0;
+	eoxact_list_overflowed = false;
+}
+
+/*
  *		RelationCacheInitializePhase2
  *
  *		This is called to prepare for access to shared catalogs during startup.

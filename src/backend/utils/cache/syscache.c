@@ -165,6 +165,21 @@ InitCatalogCache(void)
 }
 
 /*
+ * Reset backend-local syscache state so another standalone backend can start
+ * inside the same process.  Embedded initdb uses this between its bootstrap
+ * and post-bootstrap backend phases.
+ */
+void
+PGliteResetSysCache(void)
+{
+	MemSet(SysCache, 0, sizeof(SysCache));
+	SysCacheRelationOidSize = 0;
+	SysCacheSupportingRelOidSize = 0;
+	CacheInitialized = false;
+	PGliteResetCatCache();
+}
+
+/*
  * InitCatalogCachePhase2 - finish initializing the caches
  *
  * Finish initializing all the caches, including necessary database

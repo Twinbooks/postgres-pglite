@@ -226,6 +226,7 @@ extern sigjmp_buf postgresmain_sigjmp_buf;
 extern int pgl_sigsetjmp(sigjmp_buf env, int savesigs);
 extern int is_pglite_active;
 extern int pglite_single_user_startup_mode;
+FILE	   *PGliteSingleUserInputFile = NULL;
 
 static int	pglite_dummy_socket_pair[2] = {PGINVALID_SOCKET, PGINVALID_SOCKET};
 
@@ -359,8 +360,13 @@ InteractiveBackend(StringInfo inBuf)
 	/*
 	 * display a prompt and obtain input from the user
 	 */
-	printf("backend> ");
-	fflush(stdout);
+#ifdef __PGLITE__
+	if (PGliteSingleUserInputFile == NULL)
+#endif
+	{
+		printf("backend> ");
+		fflush(stdout);
+	}
 
 	resetStringInfo(inBuf);
 
@@ -443,6 +449,12 @@ static int
 interactive_getc(void)
 {
 	int			c;
+	FILE	   *input = stdin;
+
+#ifdef __PGLITE__
+	if (PGliteSingleUserInputFile != NULL)
+		input = PGliteSingleUserInputFile;
+#endif
 
 	/*
 	 * This will not process catchup interrupts or notifications while
@@ -452,7 +464,7 @@ interactive_getc(void)
 	 */
 	CHECK_FOR_INTERRUPTS();
 
-	c = getc(stdin);
+	c = getc(input);
 
 	ProcessClientReadInterrupt(false);
 

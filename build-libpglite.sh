@@ -99,7 +99,12 @@ generate_libpglite_exports() {
     nm -gU "$postgres_symbol_source" | awk '/ [A-Z] / { name=$3; sub(/^_/, "", name); print name }'
   else
     nm -g --defined-only "$postgres_symbol_source" | awk '$2 ~ /^[A-Z]$/ { print $3 }'
-  fi | awk 'NF && $0 !~ /^_?mh_/ && $0 != "main" && !seen[$0]++' > "$symbol_list"
+  fi | awk '
+    {
+      sub(/@.*/, "", $0)
+    }
+    NF && $0 !~ /^_?mh_/ && $0 != "main" && !seen[$0]++
+  ' > "$symbol_list"
 
   cat "$symbol_list" "$(pwd)/pglite/native/libpglite.exports.txt" \
     | awk 'NF && !seen[$0]++' > "$exports_path"
@@ -148,6 +153,33 @@ build_vector_extension() {
 
   cp "$extension_binary" "$INSTALL_FOLDER/lib/"
   "$MAKE_BIN" -C "$vector_dir" clean >/dev/null 2>&1 || true
+}
+
+rebuild_embedded_backend_modules() {
+  local embedded_link_flags=""
+
+  if [ "$(uname -s)" != "Darwin" ]; then
+    return
+  fi
+
+  if [ -f "$INSTALL_FOLDER/lib/libpglite.0.dylib" ]; then
+    embedded_link_flags="-L$INSTALL_FOLDER/lib -lpglite"
+  else
+    return
+  fi
+
+  "$MAKE_BIN" -C src/backend/snowball clean >/dev/null 2>&1 || true
+  "$MAKE_BIN" "${MAKE_JOB_ARGS[@]}" -C src/backend/snowball \
+    BE_DLLLIBS="$embedded_link_flags" \
+    all
+
+  "$MAKE_BIN" -C src/pl/plpgsql/src clean >/dev/null 2>&1 || true
+  "$MAKE_BIN" "${MAKE_JOB_ARGS[@]}" -C src/pl/plpgsql/src \
+    BE_DLLLIBS="$embedded_link_flags" \
+    all
+
+  cp "src/backend/snowball/dict_snowball.dylib" "$INSTALL_FOLDER/lib/"
+  cp "src/pl/plpgsql/src/plpgsql.dylib" "$INSTALL_FOLDER/lib/"
 }
 
 sign_macos_runtime_artifacts() {
@@ -211,6 +243,8 @@ clean_runtime_dirs
 "$MAKE_BIN" -C src/timezone datadir="$INSTALL_FOLDER/share" install
 
 mkdir -p "$INSTALL_FOLDER/bin" "$INSTALL_FOLDER/lib" "$INSTALL_FOLDER/share" "$INSTALL_FOLDER/share/extension" "$INSTALL_FOLDER/share/tsearch_data"
+rm -f "$INSTALL_FOLDER/bin/initdb"
+rm -rf "$INSTALL_FOLDER/share/pglite-template"
 cp "src/backend/postgres" "$INSTALL_FOLDER/bin/"
 cp "src/include/catalog/postgres.bki" "$INSTALL_FOLDER/share/"
 cp "src/backend/libpq/pg_hba.conf.sample" "$INSTALL_FOLDER/share/"
@@ -281,6 +315,7 @@ if [ -f "$INSTALL_FOLDER/lib/libpqpglite.so.5.$PG_MAJOR_VERSION" ]; then
 fi
 
 normalize_macos_runtime_artifacts
+rebuild_embedded_backend_modules
 build_vector_extension
 sign_macos_runtime_artifacts
 
