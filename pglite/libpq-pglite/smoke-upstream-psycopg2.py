@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import selectors
 
 import psycopg2
 from psycopg2.extras import Json
@@ -30,7 +31,6 @@ def main() -> None:
     cur2.execute("select count(*) from demo")
     assert cur2.fetchall() == [(1,)], cur2.fetchall()
     cur2.close()
-    conn2.close()
 
     cur.execute("create table demo_json (payload json)")
     payload = {"en_US": 'This introduces a "release to pay" mechanism and don\'t break.'}
@@ -43,6 +43,27 @@ def main() -> None:
         ('This introduces a "release to pay" mechanism and don\'t break.',),
         ('This introduces a "release to pay" mechanism and don\'t break.',),
     ], json_rows
+
+    listen_cur = conn.cursor()
+    listen_cur.execute("listen imbus")
+    conn.commit()
+    assert conn.fileno() >= 0, conn.fileno()
+
+    with selectors.DefaultSelector() as selector:
+        selector.register(conn, selectors.EVENT_READ)
+        cur2 = conn2.cursor()
+        cur2.execute("select pg_notify('imbus', %s)", ('["demo-channel"]',))
+        conn2.commit()
+        ready = selector.select(timeout=5)
+        assert ready, "LISTEN/NOTIFY selector did not become readable"
+        conn.poll()
+        payloads = [notify.payload for notify in conn.notifies]
+        assert payloads == ['["demo-channel"]'], payloads
+        conn.notifies.clear()
+        cur2.close()
+
+    conn2.close()
+    listen_cur.close()
     cur.close()
     conn.close()
 

@@ -1,12 +1,14 @@
 #include "postgres_fe.h"
 
 #include <ctype.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <strings.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -45,6 +47,12 @@ typedef struct PGLiteCell
     bool    isnull;
 } PGLiteCell;
 
+typedef struct PGLiteListenChannel
+{
+    char                       *name;
+    struct PGLiteListenChannel *next;
+} PGLiteListenChannel;
+
 typedef struct PGLiteEngine
 {
     char                   *data_dir;
@@ -57,6 +65,7 @@ typedef struct PGLiteEngine
     char                    transaction_status;
     pthread_mutex_t         mutex;
     pthread_cond_t          cond;
+    struct pg_conn         *connections;
     struct PGLiteEngine    *next;
 } PGLiteEngine;
 
@@ -104,6 +113,13 @@ struct pg_conn
     PGLiteParam            *parameters;
     PGresult               *resultHead;
     PGresult               *resultTail;
+    PGnotify               *notifyHead;
+    PGnotify               *notifyTail;
+    PGLiteListenChannel    *listenChannels;
+    int                     notifyReadFd;
+    int                     notifyWriteFd;
+    bool                    notifyPipeDirty;
+    struct pg_conn         *engineNext;
 };
 
 static pthread_mutex_t engine_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -113,6 +129,229 @@ static pthread_once_t engine_registry_atexit_once = PTHREAD_ONCE_INIT;
 static const char empty_string[] = "";
 
 static bool probe_server_version(PGLiteEngine *engine, int *server_version, char **server_version_string);
+static char *dup_string(const char *value);
+static char *dup_bytes(const char *value, size_t len);
+
+static void
+free_notify_queue(PGnotify *notify)
+{
+    while (notify != NULL)
+    {
+        PGnotify *next = notify->next;
+
+        free(notify);
+        notify = next;
+    }
+}
+
+static void
+free_listen_channels(PGLiteListenChannel *channel)
+{
+    while (channel != NULL)
+    {
+        PGLiteListenChannel *next = channel->next;
+
+        free(channel->name);
+        free(channel);
+        channel = next;
+    }
+}
+
+static bool
+set_nonblocking_fd(int fd)
+{
+    int flags;
+
+    flags = fcntl(fd, F_GETFL);
+    if (flags < 0)
+        return false;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+static bool
+init_notify_pipe(PGconn *conn)
+{
+    int pipe_fds[2];
+
+    conn->notifyReadFd = -1;
+    conn->notifyWriteFd = -1;
+
+    if (pipe(pipe_fds) != 0)
+        return false;
+    if (!set_nonblocking_fd(pipe_fds[0]) || !set_nonblocking_fd(pipe_fds[1]))
+    {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        return false;
+    }
+
+    conn->notifyReadFd = pipe_fds[0];
+    conn->notifyWriteFd = pipe_fds[1];
+    conn->notifyPipeDirty = false;
+    return true;
+}
+
+static void
+drain_notify_pipe(PGconn *conn)
+{
+    char buffer[64];
+
+    if (conn == NULL || conn->notifyReadFd < 0)
+        return;
+
+    while (read(conn->notifyReadFd, buffer, sizeof(buffer)) > 0)
+        ;
+    conn->notifyPipeDirty = false;
+}
+
+static void
+close_notify_pipe(PGconn *conn)
+{
+    if (conn == NULL)
+        return;
+
+    if (conn->notifyReadFd >= 0)
+        close(conn->notifyReadFd);
+    if (conn->notifyWriteFd >= 0)
+        close(conn->notifyWriteFd);
+    conn->notifyReadFd = -1;
+    conn->notifyWriteFd = -1;
+    conn->notifyPipeDirty = false;
+}
+
+static bool
+conn_has_listener(PGconn *conn, const char *channel)
+{
+    PGLiteListenChannel *entry;
+
+    if (conn == NULL || channel == NULL)
+        return false;
+
+    for (entry = conn->listenChannels; entry != NULL; entry = entry->next)
+    {
+        if (strcmp(entry->name, channel) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void
+conn_listen_add(PGconn *conn, const char *channel)
+{
+    PGLiteListenChannel *entry;
+
+    if (conn == NULL || channel == NULL || channel[0] == '\0' || conn_has_listener(conn, channel))
+        return;
+
+    entry = calloc(1, sizeof(*entry));
+    if (entry == NULL)
+        return;
+    entry->name = dup_string(channel);
+    if (entry->name == NULL)
+    {
+        free(entry);
+        return;
+    }
+    entry->next = conn->listenChannels;
+    conn->listenChannels = entry;
+}
+
+static void
+conn_listen_remove(PGconn *conn, const char *channel)
+{
+    PGLiteListenChannel **entry_ptr;
+
+    if (conn == NULL || channel == NULL)
+        return;
+
+    entry_ptr = &conn->listenChannels;
+    while (*entry_ptr != NULL)
+    {
+        PGLiteListenChannel *entry = *entry_ptr;
+
+        if (strcmp(entry->name, channel) == 0)
+        {
+            *entry_ptr = entry->next;
+            free(entry->name);
+            free(entry);
+            return;
+        }
+        entry_ptr = &entry->next;
+    }
+}
+
+static void
+conn_listen_clear(PGconn *conn)
+{
+    if (conn == NULL)
+        return;
+    free_listen_channels(conn->listenChannels);
+    conn->listenChannels = NULL;
+}
+
+static PGnotify *
+alloc_notify_event(int be_pid, const char *channel, const char *extra)
+{
+    size_t channel_len;
+    size_t extra_len;
+    PGnotify *notify;
+    char *storage;
+
+    channel = channel != NULL ? channel : "";
+    extra = extra != NULL ? extra : "";
+    channel_len = strlen(channel);
+    extra_len = strlen(extra);
+
+    notify = calloc(1, sizeof(*notify) + channel_len + extra_len + 2);
+    if (notify == NULL)
+        return NULL;
+
+    storage = (char *) notify + sizeof(*notify);
+    notify->be_pid = be_pid;
+    notify->relname = storage;
+    memcpy(storage, channel, channel_len + 1);
+    storage += channel_len + 1;
+    notify->extra = storage;
+    memcpy(storage, extra, extra_len + 1);
+    return notify;
+}
+
+static void
+queue_notify_event(PGconn *conn, PGnotify *notify)
+{
+    const char wake_byte = 'A';
+
+    if (conn == NULL || notify == NULL)
+    {
+        free_notify_queue(notify);
+        return;
+    }
+
+    notify->next = NULL;
+    if (conn->notifyTail != NULL)
+        conn->notifyTail->next = notify;
+    else
+        conn->notifyHead = notify;
+    conn->notifyTail = notify;
+
+    if (!conn->notifyPipeDirty && conn->notifyWriteFd >= 0)
+    {
+        if (write(conn->notifyWriteFd, &wake_byte, 1) >= 0)
+            conn->notifyPipeDirty = true;
+    }
+}
+
+static void
+engine_register_conn(PGLiteEngine *engine, PGconn *conn)
+{
+    if (engine == NULL || conn == NULL)
+        return;
+
+    pthread_mutex_lock(&engine->mutex);
+    conn->engineNext = engine->connections;
+    engine->connections = conn;
+    pthread_mutex_unlock(&engine->mutex);
+}
 
 static char *
 dup_string(const char *value)
@@ -1042,6 +1281,200 @@ extract_insert_oid(const char *command_tag)
     return oid;
 }
 
+typedef enum PGLiteListenAction
+{
+    PGLITE_LISTEN_NONE = 0,
+    PGLITE_LISTEN_ADD,
+    PGLITE_LISTEN_REMOVE,
+    PGLITE_LISTEN_REMOVE_ALL,
+} PGLiteListenAction;
+
+static const char *
+skip_sql_space(const char *ptr)
+{
+    while (*ptr != '\0' && isspace((unsigned char) *ptr))
+        ptr++;
+    return ptr;
+}
+
+static char *
+parse_sql_identifier_token(const char *ptr, const char **endptr)
+{
+    char *token = NULL;
+
+    ptr = skip_sql_space(ptr);
+    if (*ptr == '"')
+    {
+        const char *cursor = ++ptr;
+        size_t length = 0;
+
+        while (*cursor != '\0')
+        {
+            if (*cursor == '"' && cursor[1] != '"')
+                break;
+            if (*cursor == '"' && cursor[1] == '"')
+                cursor++;
+            cursor++;
+            length++;
+        }
+
+        token = malloc(length + 1);
+        if (token == NULL)
+            return NULL;
+
+        cursor = ptr;
+        length = 0;
+        while (*cursor != '\0')
+        {
+            if (*cursor == '"' && cursor[1] != '"')
+                break;
+            if (*cursor == '"' && cursor[1] == '"')
+                cursor++;
+            token[length++] = *cursor++;
+        }
+        token[length] = '\0';
+        if (*cursor == '"')
+            cursor++;
+        *endptr = cursor;
+        return token;
+    }
+
+    if (*ptr == '*')
+    {
+        token = dup_string("*");
+        if (token != NULL)
+            *endptr = ptr + 1;
+        return token;
+    }
+
+    if (!(isalpha((unsigned char) *ptr) || *ptr == '_'))
+    {
+        *endptr = ptr;
+        return NULL;
+    }
+
+    {
+        const char *cursor = ptr;
+        size_t length;
+
+        while (isalnum((unsigned char) *cursor) || *cursor == '_')
+            cursor++;
+        length = (size_t) (cursor - ptr);
+        token = dup_bytes(ptr, length);
+        if (token == NULL)
+            return NULL;
+        *endptr = cursor;
+        return token;
+    }
+}
+
+static PGLiteListenAction
+parse_listen_action(const char *query, char **channel)
+{
+    const char *ptr;
+    char *token;
+
+    *channel = NULL;
+    if (query == NULL)
+        return PGLITE_LISTEN_NONE;
+
+    ptr = skip_sql_space(query);
+    if (strncasecmp(ptr, "listen", 6) == 0 && !isalnum((unsigned char) ptr[6]) && ptr[6] != '_')
+    {
+        token = parse_sql_identifier_token(ptr + 6, &ptr);
+        if (token == NULL)
+            return PGLITE_LISTEN_NONE;
+        *channel = token;
+        return PGLITE_LISTEN_ADD;
+    }
+
+    if (strncasecmp(ptr, "unlisten", 8) == 0 && !isalnum((unsigned char) ptr[8]) && ptr[8] != '_')
+    {
+        token = parse_sql_identifier_token(ptr + 8, &ptr);
+        if (token == NULL)
+            return PGLITE_LISTEN_NONE;
+        *channel = token;
+        if (strcmp(token, "*") == 0)
+        {
+            free(token);
+            *channel = NULL;
+            return PGLITE_LISTEN_REMOVE_ALL;
+        }
+        return PGLITE_LISTEN_REMOVE;
+    }
+
+    return PGLITE_LISTEN_NONE;
+}
+
+static void
+apply_listen_action(PGconn *conn, const char *query)
+{
+    PGLiteListenAction action;
+    char *channel = NULL;
+
+    action = parse_listen_action(query, &channel);
+    if (action == PGLITE_LISTEN_NONE || conn == NULL || conn->engine == NULL)
+    {
+        free(channel);
+        return;
+    }
+
+    pthread_mutex_lock(&conn->engine->mutex);
+    switch (action)
+    {
+        case PGLITE_LISTEN_ADD:
+            conn_listen_add(conn, channel);
+            break;
+        case PGLITE_LISTEN_REMOVE:
+            conn_listen_remove(conn, channel);
+            break;
+        case PGLITE_LISTEN_REMOVE_ALL:
+            conn_listen_clear(conn);
+            break;
+        default:
+            break;
+    }
+    pthread_mutex_unlock(&conn->engine->mutex);
+    free(channel);
+}
+
+static void
+fanout_notification(PGconn *conn, int be_pid, const char *channel, const char *extra)
+{
+    PGconn *listener;
+
+    if (conn == NULL || conn->engine == NULL || channel == NULL || channel[0] == '\0')
+        return;
+
+    pthread_mutex_lock(&conn->engine->mutex);
+    for (listener = conn->engine->connections; listener != NULL; listener = listener->engineNext)
+    {
+        PGnotify *notify;
+
+        if (!conn_has_listener(listener, channel))
+            continue;
+
+        notify = alloc_notify_event(be_pid, channel, extra);
+        if (notify == NULL)
+            continue;
+        queue_notify_event(listener, notify);
+    }
+    pthread_mutex_unlock(&conn->engine->mutex);
+}
+
+static bool
+results_succeeded(const PGresult *result)
+{
+    const PGresult *entry;
+
+    for (entry = result; entry != NULL; entry = entry->next)
+    {
+        if (entry->resultStatus == PGRES_FATAL_ERROR || entry->resultStatus == PGRES_BAD_RESPONSE)
+            return false;
+    }
+    return true;
+}
+
 static bool
 parse_results(PGconn *conn, const char *data, size_t len, PGresult **head, PGresult **tail)
 {
@@ -1251,6 +1684,17 @@ parse_results(PGconn *conn, const char *data, size_t len, PGresult **head, PGres
                     conn->backendPid = (int) read_be32(payload);
                 break;
 
+            case 'A':
+            {
+                int be_pid = (int) read_be32(payload);
+                const char *channel = (const char *) payload + 4;
+                size_t channel_len = strlen(channel);
+                const char *extra = channel + channel_len + 1;
+
+                fanout_notification(conn, be_pid, channel, extra);
+                break;
+            }
+
             case 'Z':
                 break;
 
@@ -1299,6 +1743,9 @@ exec_query_to_results(PGconn *conn, const char *query, PGresult **head, PGresult
         pglite_free(out_data);
         return false;
     }
+
+    if (results_succeeded(*head))
+        apply_listen_action(conn, query);
 
     if (parse_ready_status(out_data, out_len) != '\0')
         update_transaction_status(conn, conn->engine->transaction_status);
@@ -1378,6 +1825,16 @@ PQconnectdb(const char *conninfo)
         return conn;
     }
 
+    if (!init_notify_pipe(conn))
+    {
+        set_conn_error(conn, "failed to initialize notification pipe");
+        engine_detach(conn->engine);
+        conn->engine = NULL;
+        free_conn_params(&params);
+        return conn;
+    }
+    engine_register_conn(conn->engine, conn);
+
     set_param_value(&conn->parameters, "client_encoding", "UTF8");
     set_param_value(&conn->parameters, "server_encoding", "UTF8");
     set_param_value(&conn->parameters, "standard_conforming_strings", "on");
@@ -1414,6 +1871,8 @@ PQfinish(PGconn *conn)
     clear_pending_results(conn);
     if (conn->engine != NULL)
     {
+        PGconn **entry_ptr;
+
         pthread_mutex_lock(&conn->engine->mutex);
         if (conn->engine->transaction_owner == conn
             && (conn->engine->transaction_status == 'T' || conn->engine->transaction_status == 'E'))
@@ -1430,10 +1889,29 @@ PQfinish(PGconn *conn)
             conn->engine->transaction_status = 'I';
             pthread_cond_broadcast(&conn->engine->cond);
         }
+        if (conn->notifyHead != NULL)
+        {
+            free_notify_queue(conn->notifyHead);
+            conn->notifyHead = NULL;
+            conn->notifyTail = NULL;
+        }
+        conn_listen_clear(conn);
+        entry_ptr = &conn->engine->connections;
+        while (*entry_ptr != NULL)
+        {
+            if (*entry_ptr == conn)
+            {
+                *entry_ptr = conn->engineNext;
+                conn->engineNext = NULL;
+                break;
+            }
+            entry_ptr = &(*entry_ptr)->engineNext;
+        }
         pthread_mutex_unlock(&conn->engine->mutex);
         engine_detach(conn->engine);
     }
 
+    close_notify_pipe(conn);
     free(conn->errorMessage);
     free(conn->dbname);
     free(conn->user);
@@ -1573,8 +2051,7 @@ PQerrorMessage(const PGconn *conn)
 int
 PQsocket(const PGconn *conn)
 {
-    (void) conn;
-    return -1;
+    return conn != NULL ? conn->notifyReadFd : -1;
 }
 
 int
@@ -1746,7 +2223,12 @@ PQgetResult(PGconn *conn)
 int
 PQconsumeInput(PGconn *conn)
 {
-    (void) conn;
+    if (conn == NULL || conn->engine == NULL)
+        return 0;
+
+    pthread_mutex_lock(&conn->engine->mutex);
+    drain_notify_pipe(conn);
+    pthread_mutex_unlock(&conn->engine->mutex);
     return 1;
 }
 
@@ -1776,8 +2258,22 @@ PQsetnonblocking(PGconn *conn, int arg)
 PGnotify *
 PQnotifies(PGconn *conn)
 {
-    (void) conn;
-    return NULL;
+    PGnotify *event;
+
+    if (conn == NULL || conn->engine == NULL)
+        return NULL;
+
+    pthread_mutex_lock(&conn->engine->mutex);
+    event = conn->notifyHead;
+    if (event != NULL)
+    {
+        conn->notifyHead = event->next;
+        if (conn->notifyHead == NULL)
+            conn->notifyTail = NULL;
+        event->next = NULL;
+    }
+    pthread_mutex_unlock(&conn->engine->mutex);
+    return event;
 }
 
 int
