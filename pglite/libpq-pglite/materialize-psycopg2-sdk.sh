@@ -18,6 +18,25 @@ copy_public_headers() {
   cp "$ROOT_DIR/src/include/libpq/libpq-fs.h" "$SDK_DIR/include/libpq/"
 }
 
+copy_runtime_backend_modules() {
+  local runtime_lib="$RUNTIME_DIR/lib"
+  local sdk_lib="$SDK_DIR/lib"
+  local artifact base
+
+  mkdir -p "$sdk_lib"
+
+  for artifact in "$runtime_lib"/*; do
+    [ -f "$artifact" ] || continue
+    base=$(basename "$artifact")
+    case "$base" in
+      libpq.*|libpglite.*|libpqpglite.*)
+        continue
+        ;;
+    esac
+    cp "$artifact" "$sdk_lib/$base"
+  done
+}
+
 replace_install_name_if_present() {
   local target_file="$1"
   local old_name="$2"
@@ -48,10 +67,12 @@ materialize_macos_sdk() {
   install_name_tool -id "$sdk_wrapper" "$sdk_wrapper"
   replace_install_name_if_present "$sdk_wrapper" "@loader_path/libpglite.0.dylib" "$sdk_libpglite"
   replace_install_name_if_present "$sdk_wrapper" "$runtime_libpglite" "$sdk_libpglite"
+  copy_runtime_backend_modules
 
   if command -v codesign >/dev/null 2>&1; then
     codesign --force -s - "$sdk_libpglite" >/dev/null
     codesign --force -s - "$sdk_wrapper" >/dev/null
+    find "$sdk_lib" -maxdepth 1 -type f ! -name 'libpglite.0.dylib' ! -name 'libpq.5.dylib' -exec codesign --force -s - {} \; >/dev/null
   fi
 }
 
@@ -74,6 +95,7 @@ materialize_linux_sdk() {
   cp "$runtime_libpglite" "$sdk_lib/$(basename "$runtime_libpglite")"
   ln -sf "$(basename "$runtime_wrapper")" "$sdk_lib/libpq.so.5"
   ln -sf "libpq.so.5" "$sdk_lib/libpq.so"
+  copy_runtime_backend_modules
 }
 
 write_pg_config() {
